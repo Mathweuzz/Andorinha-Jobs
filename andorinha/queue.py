@@ -2,17 +2,26 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta
 from typing import Any, Optional, Dict
 
 from .storage import get_conn, utc_now_str
 from .clock import now as real_now
 
 
+def _fmt_iso(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def _iso_after(seconds: int, *, now_fn=real_now) -> str:
     t = now_fn()
-    t2 = t + __import__("datetime").timedelta(seconds=seconds)
-    # yyyy-mm-ddTHH:MM:SS.mmmZ
-    return t2.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    t2 = t + timedelta(seconds=seconds)
+    return _fmt_iso(t2)
+
+
+def _parse_iso_z(s: str) -> datetime:
+    # Aceita "YYYY-MM-DDTHH:MM:SS.mmmZ"
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
 def enqueue(
@@ -33,7 +42,7 @@ def enqueue(
     Todos os timestamps são UTC (ISO-8601 com 'Z').
     """
     conn = get_conn(db_path)
-    created = utc_now_str() if now_fn is real_now else _iso_after(0, now_fn=now_fn)
+    created = utc_now_str() if now_fn is real_now else _fmt_iso(now_fn())
     updated = created
     payload_str = payload if (payload is None or isinstance(payload, str)) else json.dumps(payload)
     conn.execute("BEGIN IMMEDIATE;")
@@ -83,7 +92,7 @@ def dequeue_with_lease(
     com novo lease (TTL) e retorna o registro como dict. Se não houver, retorna None.
     """
     conn = get_conn(db_path)
-    now_str = utc_now_str() if now_fn is real_now else _iso_after(0, now_fn=now_fn)
+    now_str = utc_now_str() if now_fn is real_now else _fmt_iso(now_fn())
     lease_exp = _iso_after(lease_ttl_sec, now_fn=now_fn)
 
     conn.execute("BEGIN IMMEDIATE;")
@@ -154,27 +163,44 @@ def extend_lease(
     now_fn=real_now,
 ) -> bool:
     """
-    Estende o lease se o job ainda estiver 'leased' e não expirado.
+    Estende o lease **somando** `add_ttl_sec` ao valor atual de lease_expires_at,
+    desde que o job ainda esteja 'leased' e que o lease **não tenha expirado**.
     Retorna True se atualizado; False caso contrário.
     """
     conn = get_conn(db_path)
-    now_str = utc_now_str() if now_fn is real_now else _iso_after(0, now_fn=now_fn)
+    now_str = utc_now_str() if now_fn is real_now else _fmt_iso(now_fn())
+
     conn.execute("BEGIN IMMEDIATE;")
     try:
-        cur = conn.execute(
+        row = conn.execute(
             """
-            UPDATE jobs
-            SET lease_expires_at = ?,
-                updated_at = ?
+            SELECT lease_expires_at FROM jobs
             WHERE id = ?
               AND status='leased'
               AND lease_expires_at IS NOT NULL
               AND lease_expires_at > ?;
             """,
-            (_iso_after(add_ttl_sec, now_fn=now_fn), now_str, int(job_id), now_str),
+            (int(job_id), now_str),
+        ).fetchone()
+
+        if not row:
+            conn.commit()
+            return False
+
+        old_exp = _parse_iso_z(row["lease_expires_at"])
+        new_exp = old_exp + timedelta(seconds=add_ttl_sec)
+
+        conn.execute(
+            """
+            UPDATE jobs
+            SET lease_expires_at = ?,
+                updated_at = ?
+            WHERE id = ?;
+            """,
+            (_fmt_iso(new_exp), now_str, int(job_id)),
         )
         conn.commit()
-        return cur.rowcount == 1
+        return True
     except Exception:
         try:
             conn.rollback()
@@ -197,7 +223,7 @@ def release(
     (Backoff será integrado no passo 4.)
     """
     conn = get_conn(db_path)
-    now_str = utc_now_str() if now_fn is real_now else _iso_after(0, now_fn=now_fn)
+    now_str = utc_now_str() if now_fn is real_now else _fmt_iso(now_fn())
 
     conn.execute("BEGIN IMMEDIATE;")
     try:
