@@ -29,13 +29,12 @@ def utc_now_str() -> str:
 def _configure_connection(conn: sqlite3.Connection) -> None:
     conn.row_factory = sqlite3.Row
     # transações explícitas (BEGIN/COMMIT) quando necessário
-    conn.isolation_level = None  # autocommit; usamos BEGIN IMMEDIATE quando preciso
+    conn.isolation_level = None  # autocommit; usamos BEGIN IMMEDIATE manualmente
     # PRAGMAs por conexão
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.execute("PRAGMA busy_timeout = 5000;")
     mode = conn.execute("PRAGMA journal_mode = WAL;").fetchone()[0]
     if str(mode).lower() != "wal":
-        # Em alguns FS especiais pode não ativar; ainda assim exigimos WAL.
         raise RuntimeError(f"Falha ao ativar WAL, journal_mode={mode!r}")
 
 def get_conn(db_path: str | None = None) -> sqlite3.Connection:
@@ -47,7 +46,6 @@ def get_conn(db_path: str | None = None) -> sqlite3.Connection:
     conns = _ensure_thread_dict()
     conn = conns.get(db_path)
     if conn is None:
-        # check_same_thread=True (padrão): conexão só no thread atual → nossa estratégia.
         conn = sqlite3.connect(db_path, check_same_thread=True)
         _configure_connection(conn)
         conns[db_path] = conn
@@ -143,19 +141,28 @@ def migrate(conn: sqlite3.Connection) -> int:
     """
     Aplica migrações até a versão mais recente. Retorna versão aplicada.
     Idempotente: chamar múltiplas vezes não altera estado após atualizado.
+    Usa BEGIN IMMEDIATE + commit/rollback do driver (conn.commit/rollback).
     """
-    # Início de transação de migração
-    conn.execute("BEGIN IMMEDIATE;")
+    ver = _current_version(conn)
+    if ver >= 1:
+        return ver
+
+    # Abrir transação explicitamente (em autocommit, precisamos do BEGIN)
     try:
-        ver = _current_version(conn)
-        if ver < 1:
-            conn.executescript(SCHEMA_V1)
-            conn.execute("INSERT INTO schema_migrations(version) VALUES (1);")
-            conn.execute("COMMIT;")
-            return 1
-        else:
-            conn.execute("COMMIT;")
-            return ver
+        conn.execute("BEGIN IMMEDIATE;")
+    except sqlite3.OperationalError:
+        # fallback para BEGIN normal em FS mais chatos
+        conn.execute("BEGIN;")
+
+    try:
+        conn.executescript(SCHEMA_V1)
+        conn.execute("INSERT INTO schema_migrations(version) VALUES (1);")
+        conn.commit()
+        return 1
     except Exception:
-        conn.execute("ROLLBACK;")
+        # Garanta que rollback não cause novo erro se a transação já caiu
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         raise
