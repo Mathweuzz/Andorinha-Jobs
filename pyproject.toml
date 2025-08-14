@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "andorinha-jobs"
+version = "0.1.0"
+description = "Andorinha Jobs — Orquestrador de Tarefas (stdlib-only)"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Mateus Gomes de Araújo" }]
+license = { text = "MIT" }
+keywords = ["jobs", "scheduler", "queue", "stdlib", "sqlite", "cron"]
+
+[tool.setuptools.packages.find]
+include = ["andorinha*"]
